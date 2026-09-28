@@ -16,6 +16,13 @@ public enum DropReason {
     EXPORTER_UNAVAILABLE,
     /** The exporter threw while handling the event. */
     EXPORT_FAILED,
+    /**
+     * The request was selected <em>not</em> to be exported by the sampling
+     * policy. This is a deliberate policy decision, not a fault: the event
+     * never reached the export queue, so it is distinct from queue/export
+     * degradation reasons.
+     */
+    SAMPLED_OUT,
     /** The pipeline is shutting down and no longer accepts events. */
     SHUTTING_DOWN
 }

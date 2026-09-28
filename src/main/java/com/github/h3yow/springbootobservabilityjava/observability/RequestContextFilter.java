@@ -34,13 +34,16 @@ public class RequestContextFilter extends OncePerRequestFilter {
 
     private final MetricsRegistry metricsRegistry;
     private final MetricsExportQueue exportQueue;
+    private final Sampler sampler;
     private final ObservabilityProperties properties;
 
     public RequestContextFilter(MetricsRegistry metricsRegistry,
                                 MetricsExportQueue exportQueue,
+                                Sampler sampler,
                                 ObservabilityProperties properties) {
         this.metricsRegistry = metricsRegistry;
         this.exportQueue = exportQueue;
+        this.sampler = sampler;
         this.properties = properties;
     }
 
@@ -59,18 +62,33 @@ public class RequestContextFilter extends OncePerRequestFilter {
         RequestContextHolder.attach(context);
         response.setHeader(properties.getRequestIdHeader(), context.requestId());
 
+        // Decide at request entry against the ratios in force right now; the
+        // verdict is memoized on the context, so a later runtime ratio change
+        // can neither re-attribute nor re-decide this in-flight request.
+        SamplingDecision decision = sampler.decide(context);
+        log.info("sampling decision: requestId={} endpoint={} sampled={} ratio={} basis={}",
+                context.requestId(), endpoint, decision.sampled(), decision.ratio(),
+                decision.basis());
+
         boolean success = false;
         try {
             filterChain.doFilter(request, response);
             success = response.getStatus() < 500;
         } finally {
             long latencyNanos = context.elapsedNanos();
+            // Metrics always reflect every completed request; sampling only
+            // gates export, never success/failure or latency accounting.
             metricsRegistry.record(endpoint, success, latencyNanos);
-            DropReason drop = exportQueue.submit(
-                    new MetricsEvent(context.requestId(), endpoint, success, latencyNanos));
-            if (drop != null) {
-                log.warn("metrics event dropped: requestId={} endpoint={} reason={}",
-                        context.requestId(), endpoint, drop);
+            if (decision.sampled()) {
+                DropReason drop = exportQueue.submit(
+                        new MetricsEvent(context.requestId(), endpoint, success, latencyNanos));
+                if (drop != null) {
+                    log.warn("metrics event dropped: requestId={} endpoint={} reason={}",
+                            context.requestId(), endpoint, drop);
+                }
+            } else {
+                log.info("metrics event not exported: requestId={} endpoint={} reason={} basis={}",
+                        context.requestId(), endpoint, DropReason.SAMPLED_OUT, decision.basis());
             }
             RequestContextHolder.detach();
         }

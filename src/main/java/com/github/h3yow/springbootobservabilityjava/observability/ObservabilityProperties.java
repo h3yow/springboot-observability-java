@@ -2,6 +2,9 @@ package com.github.h3yow.springbootobservabilityjava.observability;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * Configuration for the observability pipeline.
  *
@@ -26,6 +29,9 @@ public class ObservabilityProperties {
 
     /** Header used to carry the request id in and out of the service. */
     private String requestIdHeader = "X-Request-Id";
+
+    /** Head-sampling configuration. */
+    private Sampling sampling = new Sampling();
 
     public int getExportQueueCapacity() {
         return exportQueueCapacity;
@@ -57,5 +63,39 @@ public class ObservabilityProperties {
 
     public void setRequestIdHeader(String requestIdHeader) {
         this.requestIdHeader = requestIdHeader;
+    }
+
+    public Sampling getSampling() {
+        return sampling;
+    }
+
+    public void setSampling(Sampling sampling) {
+        this.sampling = sampling;
+    }
+
+    /** Per-endpoint head-sampling configuration. */
+    public static class Sampling {
+
+        /** Ratio applied to endpoints without an explicit override; 1.0 = export everything. */
+        private double defaultRatio = 1.0;
+
+        /** Endpoint name ({@code METHOD /pattern}) to ratio override in [0,1]. */
+        private Map<String, Double> endpoints = new LinkedHashMap<>();
+
+        public double getDefaultRatio() {
+            return defaultRatio;
+        }
+
+        public void setDefaultRatio(double defaultRatio) {
+            this.defaultRatio = defaultRatio;
+        }
+
+        public Map<String, Double> getEndpoints() {
+            return endpoints;
+        }
+
+        public void setEndpoints(Map<String, Double> endpoints) {
+            this.endpoints = endpoints;
+        }
     }
 }

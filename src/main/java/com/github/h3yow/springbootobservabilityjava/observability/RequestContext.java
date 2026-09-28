@@ -17,6 +17,13 @@ public final class RequestContext {
     private final String endpoint;
     private final long startNanos;
 
+    /**
+     * Memoized sampling decision for this request, computed exactly once on
+     * first access. The slot is the only mutable state and lives and dies with
+     * the request, so caching decisions cannot grow unboundedly.
+     */
+    private volatile SamplingDecision samplingDecision;
+
     private RequestContext(String requestId, String endpoint, long startNanos) {
         this.requestId = Objects.requireNonNull(requestId, "requestId");
         this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
@@ -54,6 +61,16 @@ public final class RequestContext {
     /** Elapsed time since the request started, in nanoseconds. */
     public long elapsedNanos() {
         return System.nanoTime() - startNanos;
+    }
+
+    /** Memoized sampling decision, or {@code null} if not yet decided. */
+    SamplingDecision samplingDecision() {
+        return samplingDecision;
+    }
+
+    /** Stores the decision computed by {@link Sampler}; package-private by design. */
+    void setSamplingDecision(SamplingDecision decision) {
+        this.samplingDecision = decision;
     }
 
     @Override
