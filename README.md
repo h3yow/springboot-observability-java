@@ -11,8 +11,9 @@ HTTP 请求
   └─ RequestContextFilter          创建 RequestContext（每请求恰好一次），绑定到请求线程
        ├─ RequestContextHolder     ThreadLocal 持有；attach 拒绝重复注入；finally 中 detach
        ├─ ContextPropagator        包装 Runnable/Callable/Executor，把上下文带到异步分支
-       ├─ MetricsRegistry          接口维度计数（LongAdder，并发安全）
-       └─ MetricsExportQueue       有界队列 + 分发线程 + 导出超时 + 丢弃原因统计
+       ├─ MetricsRegistry          接口维度计数（LongAdder，并发安全）——每个请求都记录，不受采样影响
+       ├─ Sampler                  按接口采样（默认比例 + 按接口覆盖），结论按请求记忆、可运行时调整
+       └─ MetricsExportQueue       有界队列 + 分发线程 + 导出超时 + 丢弃原因统计（仅放行被采样的事件）
             └─ MetricsExporter     导出器（默认 LoggingMetricsExporter，可切换可用性）
 ```
 
@@ -49,6 +50,60 @@ HTTP 请求
 不变量：`total == success + failure`。计数基于 `LongAdder`，并发写入不丢失、
 不重复（`MetricsRegistryConcurrencyTest` 以 16 线程 × 5000 次验证精确相等）。
 
+## 采样策略
+
+导出（不是指标）在进入有界队列之前先过一层 `Sampler`：
+
+- **按接口配置 + 统一默认值**：接口名沿用稳定的 `METHOD /path`。每个接口命中自己的
+  覆盖比例就用覆盖值，否则用 `observability.default-sample-rate`。
+- **边界精确**：比例取值闭区间 `[0.0, 1.0]`。`0.0` = 一个都不导（阈值 0，
+  任何哈希桶都不命中）；`1.0` = 一个都不漏（阈值 = 桶总数）。边界不经过浮点比较，
+  不会出现“配了全采还被挡下 / 配了全弃还往外导”。内点比例映射到 `10000` 个桶，
+  由 requestId 的稳定 FNV-1a 哈希取桶，`bucket < round(rate * 10000)` 即放行。
+- **判定可复现**：判定是 `(requestId, 生效比例)` 的纯函数；结论（放/弃、比例、
+  来源、桶、阈值）缓存在**请求上下文自身**上。同一请求在链路里（含扇出分支、并发、
+  被反复调用）算多少次都得到同一个 `SamplingDecision`，不会一次导一次不导；
+  缓存随请求生灭、每请求至多一条，天然有界，不会无界增长。
+- **只影响导出，不影响统计**：成功/失败计数与耗时直方图对**每个**完成的请求照常记录，
+  采样只决定“导不导出这一条事件”，不会把计数和耗时搞乱。
+- **不伪造归属**：缺失请求上下文时采样直接拒绝（`NullPointerException`），
+  不会给事件安一个假接口。
+- **业务不被阻塞**：采样判定是内存计算（读一次 volatile 配置 + 一次 CAS），
+  不做 I/O；被挡下的事件根本不入队，队列压力随比例线性下降。
+
+### 配置（启动时）
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `observability.default-sample-rate` | 1.0 | 未单独配置接口的统一采样比例，`[0.0, 1.0]` |
+| `observability.sample-rates[<接口名>]` | 无 | 按接口覆盖，键为 `METHOD /path`，如 `observability.sample-rates[GET /demo/work]=0.1` |
+
+默认 `1.0` 与历史行为完全一致：升级后不配任何采样项即全量导出（向后兼容）。
+非法比例（负数、>1、NaN）在配置/调整时立即拒绝，配置保持不变。
+
+### 运行时调整（无需重启）
+
+比例存于一个 `volatile` 指向的**不可变配置快照**：
+
+- **新请求立即生效**：快照原子替换后，下一个请求读到的就是新比例；
+- **在途请求归属不变**：已在处理中的请求沿用首次判定时缓存的结论和当时的比例，
+  中途改比例不会翻盘，也不会串到别的请求上；
+- **并发计数精确**：只有“赢下”该请求缓存的那一次判定更新计数（`LongAdder`），
+  并发采样 + 并发调整下不丢、不重。
+
+HTTP 接口：
+
+```bash
+curl -s localhost:8080/observability/sampling/config                          # 当前默认比例与覆盖
+curl -s localhost:8080/observability/sampling/stats                           # 各接口 considered/sampled/notSampled 与实际生效比例及来源
+curl -s -XPOST 'localhost:8080/observability/sampling/default-rate?rate=0.1'  # 调整默认比例
+curl -s -XPOST 'localhost:8080/observability/sampling/endpoint-rate?endpoint=GET%20%2Fdemo%2Fwork&rate=0.05'  # 调整单接口
+curl -s -XPOST 'localhost:8080/observability/sampling/endpoint-rate?endpoint=GET%20%2Fdemo%2Fwork&remove=true' # 删除覆盖，回归默认
+```
+
+被挡下的事件以独立原因 `NOT_SAMPLED` 统计，可在 `/observability/drops` 读取，
+并打 WARN 日志（含 `requestId`、接口、比例、比例来源、桶与阈值），便于复现。
+
 ## 采样与降级策略
 
 导出链路的容量与超时均可配置（`application.properties`）：
@@ -63,13 +118,18 @@ HTTP 请求
 保证：**不阻塞业务响应**（入队最多等待 `offer-timeout-millis`）、**不无界增长**
 （容量固定）、**不静默丢弃**——每个被拒绝/丢弃的事件都计入且仅计入一个原因：
 
-| `DropReason` | 触发条件 |
-|---|---|
-| `QUEUE_FULL` | 队列已满（背压） |
-| `EXPORT_TIMEOUT` | 单次导出超过 `export-timeout-millis` |
-| `EXPORTER_UNAVAILABLE` | 导出器自报不可用，或上一次导出卡死未恢复 |
-| `EXPORT_FAILED` | 导出器抛异常 |
-| `SHUTTING_DOWN` | 管线关闭中/关闭后提交，或关闭时队列残留 |
+| `DropReason` | 触发条件 | 阶段 |
+|---|---|---|
+| `NOT_SAMPLED` | 按采样策略主动不导出（事件根本没进入队列） | 采样（入队前，主动决策） |
+| `QUEUE_FULL` | 队列已满（背压） | 导出（入队时，被动降级） |
+| `EXPORT_TIMEOUT` | 单次导出超过 `export-timeout-millis` | 导出（导出时，被动降级） |
+| `EXPORTER_UNAVAILABLE` | 导出器自报不可用，或上一次导出卡死未恢复 | 导出（被动降级） |
+| `EXPORT_FAILED` | 导出器抛异常 | 导出（被动降级） |
+| `SHUTTING_DOWN` | 管线关闭中/关闭后提交，或关闭时队列残留 | 关闭 |
+
+`NOT_SAMPLED` 与其余原因的区别：前者是**入队之前的主动比例决策**（系统健康、
+工作正常，只是按比例不放行），后者都是**进入导出链路后的被动故障/背压**。
+两者分开计数，排查“为什么没导出”时不会混淆。
 
 导出器卡死（忽略中断）时，后续事件以 `EXPORTER_UNAVAILABLE` 快速拒绝，
 不会堆积在卡死任务之后；导出器恢复后自动继续。
@@ -87,16 +147,22 @@ mvn spring-boot:run
 ```bash
 curl -s localhost:8080/demo/work                       # 产生流量（响应头含 X-Request-Id）
 curl -s localhost:8080/demo/fanout                     # 异步扇出：分支与父请求同 requestId
-curl -s localhost:8080/observability/metrics           # 接口维度指标
-curl -s localhost:8080/observability/drops             # 丢弃原因计数
+curl -s localhost:8080/observability/metrics           # 接口维度指标（全量，不受采样影响）
+curl -s localhost:8080/observability/drops             # 丢弃原因计数（含独立的 NOT_SAMPLED）
 curl -s localhost:8080/observability/pipeline          # 队列容量/积压/已接受/已导出
+curl -s localhost:8080/observability/sampling/config   # 当前默认采样比例与按接口覆盖
+curl -s localhost:8080/observability/sampling/stats    # 各接口采样计数与实际生效比例
+curl -s -XPOST 'localhost:8080/observability/sampling/default-rate?rate=0.0'     # 运行时改成全弃
+curl -s -XPOST 'localhost:8080/observability/sampling/default-rate?rate=1.0'     # 恢复全采
 curl -s -XPOST 'localhost:8080/observability/exporter/availability?available=false'  # 模拟导出器宕机
 curl -s -XPOST 'localhost:8080/observability/exporter/availability?available=true'   # 恢复
 ```
 
-降级演练：关闭导出器后再访问 `/demo/work`，业务响应仍 200，
-`/observability/drops` 中 `EXPORTER_UNAVAILABLE` 递增，且 WARN 日志打印
-`requestId` 与丢弃原因。
+采样演练：把默认比例调成 `0.0` 后连续访问 `/demo/work`，业务响应仍 200、
+`/observability/metrics` 的计数照常增长，但 `/observability/drops` 中只有
+`NOT_SAMPLED` 递增、`/observability/pipeline` 的 `accepted` 不增长，WARN 日志打印
+`requestId` 与判定依据（比例、来源、桶、阈值）。调回 `1.0` 后新请求立即恢复导出，
+无需重启。
 
 ## 测试
 
@@ -106,9 +172,11 @@ mvn test
 
 | 测试类 | 覆盖场景 |
 |---|---|
-| `RequestContextPropagationTest` | 16 请求 × 8 分支并发归属、重复注入拒绝、池化线程不串号、无上下文不伪造 |
-| `MetricsRegistryConcurrencyTest` | 16 线程 × 5000 次并发计数精确一致、接口间隔离、直方图全覆盖 |
-| `MetricsExportQueueTest` | 队列满非阻塞拒绝、导出超时、导出器不可用/卡死/异常、关闭语义、正常路径零丢弃 |
-| `ObservabilityEndToEndTest` | 真实 HTTP 栈：请求标识回显、扇出归属、失败计数、导出器宕机时业务不受影响且丢弃可见 |
+| `RequestContextPropagationTest` | 16 请求 × 8 分支并发归属、重复注入拒绝、池化线程不串号、无上下文不伪造（无回归） |
+| `MetricsRegistryConcurrencyTest` | 16 线程 × 5000 次并发计数精确一致、接口间隔离、直方图全覆盖（无回归） |
+| `MetricsExportQueueTest` | 队列满非阻塞拒绝、导出超时、导出器不可用/卡死/异常、关闭语义、正常路径零丢弃（无回归） |
+| `ObservabilityEndToEndTest` | 真实 HTTP 栈：请求标识回显、扇出归属、失败计数、导出器宕机时业务不受影响且丢弃可见（无回归） |
+| `SamplerTest` | 边界 0.0/1.0 精确、按接口覆盖走默认、内点比例近似、同一请求反复/并发判定稳定、运行时改比例立即生效、在途请求翻盘防护、并发判定 + 并发改比例计数精确、缺失上下文不伪造、非法比例拒绝、跨实例可复现 |
+| `SamplingEndToEndTest` | 真实 HTTP 栈：全弃时业务正常且指标仍全量、`NOT_SAMPLED` 与队列原因分列、全采全导、失败仍计数、按接口覆盖与运行时调整立即生效 |
 
 测试日志均打印请求标识与判定依据（`verdict:` 行），可复现验证。

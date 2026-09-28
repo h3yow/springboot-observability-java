@@ -26,6 +26,11 @@ public class ObservabilityConfig {
         return new LoggingMetricsExporter();
     }
 
+    @Bean
+    public Sampler sampler(ObservabilityProperties properties) {
+        return new Sampler(properties.getDefaultSampleRate(), properties.getSampleRates());
+    }
+
     @Bean(destroyMethod = "close")
     public MetricsExportQueue metricsExportQueue(ObservabilityProperties properties,
                                                  LoggingMetricsExporter exporter) {
@@ -41,9 +46,9 @@ public class ObservabilityConfig {
     @Bean
     public FilterRegistrationBean<RequestContextFilter> requestObservabilityFilter(
             MetricsRegistry metricsRegistry, MetricsExportQueue exportQueue,
-            ObservabilityProperties properties) {
+            Sampler sampler, ObservabilityProperties properties) {
         FilterRegistrationBean<RequestContextFilter> registration = new FilterRegistrationBean<>(
-                new RequestContextFilter(metricsRegistry, exportQueue, properties));
+                new RequestContextFilter(metricsRegistry, exportQueue, sampler, properties));
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
         registration.addUrlPatterns("/*");
         return registration;

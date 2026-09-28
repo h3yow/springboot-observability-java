@@ -2,6 +2,7 @@ package com.github.h3yow.springbootobservabilityjava.observability;
 
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Immutable request-scoped execution context.
@@ -16,6 +17,11 @@ public final class RequestContext {
     private final String requestId;
     private final String endpoint;
     private final long startNanos;
+    /**
+     * Memoized sampling decision for this request — at most one entry for the
+     * whole request lifetime, so decision caches can never grow unboundedly.
+     */
+    private final AtomicReference<SamplingDecision> samplingDecision = new AtomicReference<>();
 
     private RequestContext(String requestId, String endpoint, long startNanos) {
         this.requestId = Objects.requireNonNull(requestId, "requestId");
@@ -54,6 +60,20 @@ public final class RequestContext {
     /** Elapsed time since the request started, in nanoseconds. */
     public long elapsedNanos() {
         return System.nanoTime() - startNanos;
+    }
+
+    /**
+     * Atomically memoizes the request's sampling decision. The first candidate
+     * wins, so the same request evaluated many times (including from concurrent
+     * branches) always observes the identical decision.
+     *
+     * @return the winning decision — {@code candidate} on the first call,
+     *         the previously installed one afterwards.
+     */
+    SamplingDecision memoizeSamplingDecision(SamplingDecision candidate) {
+        return samplingDecision.compareAndSet(null, candidate)
+                ? candidate
+                : samplingDecision.get();
     }
 
     @Override

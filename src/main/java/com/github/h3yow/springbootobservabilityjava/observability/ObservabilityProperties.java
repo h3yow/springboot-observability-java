@@ -2,6 +2,9 @@ package com.github.h3yow.springbootobservabilityjava.observability;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * Configuration for the observability pipeline.
  *
@@ -10,6 +13,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * observability.offer-timeout-millis=0          # max time a request thread may wait to enqueue (0 = non-blocking)
  * observability.export-timeout-millis=500       # max time one export may take before the event is dropped as EXPORT_TIMEOUT
  * observability.request-id-header=X-Request-Id  # inbound/outbound request id header
+ *
+ * # Sampling policy (1.0 = export every event, 0.0 = export none)
+ * observability.default-sample-rate=1.0                        # rate for endpoints without an override
+ * observability.sample-rates[GET /demo/work]=0.1               # per-endpoint overrides
  * </pre>
  */
 @ConfigurationProperties(prefix = "observability")
@@ -26,6 +33,28 @@ public class ObservabilityProperties {
 
     /** Header used to carry the request id in and out of the service. */
     private String requestIdHeader = "X-Request-Id";
+
+    /** Default sampling rate applied to endpoints without an override; 1.0 = all, 0.0 = none. */
+    private double defaultSampleRate = 1.0;
+
+    /** Per-endpoint sampling rate overrides, keyed by the stable endpoint name. */
+    private Map<String, Double> sampleRates = new LinkedHashMap<>();
+
+    public double getDefaultSampleRate() {
+        return defaultSampleRate;
+    }
+
+    public void setDefaultSampleRate(double defaultSampleRate) {
+        this.defaultSampleRate = defaultSampleRate;
+    }
+
+    public Map<String, Double> getSampleRates() {
+        return sampleRates;
+    }
+
+    public void setSampleRates(Map<String, Double> sampleRates) {
+        this.sampleRates = sampleRates;
+    }
 
     public int getExportQueueCapacity() {
         return exportQueueCapacity;
