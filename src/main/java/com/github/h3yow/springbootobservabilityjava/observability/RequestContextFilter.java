@@ -19,12 +19,18 @@ import java.io.IOException;
  *       request-id header, generating one otherwise) and binds it to the
  *       request thread;</li>
  *   <li>echoes the request id on the response so callers can correlate;</li>
+ *   <li><b>pins the sampling decision at request entry</b>: the policy is
+ *       evaluated exactly once, before the request starts being processed, and
+ *       the verdict stays fixed for the request's whole lifetime (including any
+ *       fan-out branches, which share the same context and memo). A runtime
+ *       rate change therefore never flips an in-flight request — only requests
+ *       that start after the change see the new rate;</li>
  *   <li>on completion, records endpoint metrics for <em>every</em> request and,
- *       if the per-request {@link Sampler} decision keeps it, submits one
- *       export event — always in a {@code finally} block, so the context is
- *       detached and the request thread is never leaked into the pool.
- *       Suppressed events are logged with the decision basis as
- *       {@code NOT_SAMPLED}, distinct from queue/exporter drops.</li>
+ *       if the pinned decision kept it, submits one export event — always in a
+ *       {@code finally} block, so the context is detached and the request
+ *       thread is never leaked into the pool. Suppressed events are logged with
+ *       the decision basis as {@code NOT_SAMPLED}, distinct from queue/exporter
+ *       drops.</li>
  * </ol>
  *
  * <p>Duplicate injection is rejected: if a context is already bound to the
@@ -65,28 +71,43 @@ public class RequestContextFilter extends OncePerRequestFilter {
         RequestContextHolder.attach(context);
         response.setHeader(properties.getRequestIdHeader(), context.requestId());
 
+        // Pin the verdict BEFORE the request starts being processed: whatever
+        // the policy says now is the verdict for this whole request. A rate
+        // change while the request is in flight cannot flip it — the memo on
+        // the context guarantees that even re-evaluation (e.g. from a fan-out
+        // branch) returns the identical decision, counted exactly once.
+        SamplingDecision decision = sampler.decide(context);
+        if (log.isDebugEnabled()) {
+            log.debug("sampling decision pinned at request entry: requestId={} {}",
+                    context.requestId(), decision.basis());
+        }
+
         boolean success = false;
         try {
             filterChain.doFilter(request, response);
             success = response.getStatus() < 500;
         } finally {
-            long latencyNanos = context.elapsedNanos();
-            // Sampling affects export only: success/failure counts and latency
-            // stats always cover every completed request.
-            metricsRegistry.record(endpoint, success, latencyNanos);
+            try {
+                long latencyNanos = context.elapsedNanos();
+                // Sampling affects export only: success/failure counts and latency
+                // stats always cover every completed request.
+                metricsRegistry.record(endpoint, success, latencyNanos);
 
-            SamplingDecision decision = sampler.decide(context);
-            if (!decision.sampled()) {
-                log.warn("metrics event not sampled: requestId={} {}", context.requestId(), decision.basis());
-            } else {
-                DropReason drop = exportQueue.submit(
-                        new MetricsEvent(context.requestId(), endpoint, success, latencyNanos));
-                if (drop != null) {
-                    log.warn("metrics event dropped: requestId={} endpoint={} reason={}",
-                            context.requestId(), endpoint, drop);
+                // Reuse the entry-pinned verdict — never re-evaluate here, or an
+                // in-flight rate change could change the outcome.
+                if (!decision.sampled()) {
+                    log.warn("metrics event not sampled: requestId={} {}", context.requestId(), decision.basis());
+                } else {
+                    DropReason drop = exportQueue.submit(
+                            new MetricsEvent(context.requestId(), endpoint, success, latencyNanos));
+                    if (drop != null) {
+                        log.warn("metrics event dropped: requestId={} endpoint={} reason={}",
+                                context.requestId(), endpoint, drop);
+                    }
                 }
+            } finally {
+                RequestContextHolder.detach();
             }
-            RequestContextHolder.detach();
         }
     }
 

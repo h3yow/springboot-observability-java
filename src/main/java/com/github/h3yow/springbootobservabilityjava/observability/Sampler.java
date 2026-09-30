@@ -6,7 +6,6 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Per-endpoint sampling policy, adjustable at runtime.
@@ -29,8 +28,10 @@ import java.util.concurrent.atomic.LongAdder;
  *       requests already in flight keep their memoized decision, so a mid-flight
  *       change never re-attributes or flips an in-flight request.</li>
  *   <li><b>Counts are exact under concurrency</b>: only the single winning
- *       memoization per request updates {@link LongAdder} stats, so decisions
- *       are neither lost nor double-counted.</li>
+ *       memoization per request updates the per-endpoint counters, and both the
+ *       commit and the count snapshots are linearized on one lock, so decisions
+ *       are neither lost nor double-counted and a snapshot can never show a torn
+ *       or momentarily shrinking total.</li>
  *   <li><b>No invented attribution</b>: {@code null} contexts are rejected,
  *       never attributed to a synthetic endpoint.</li>
  * </ul>
@@ -43,9 +44,18 @@ public final class Sampler {
     private record Config(double defaultRate, Map<String, Double> overrides) {
     }
 
+    /**
+     * Per-endpoint counters. Both fields are guarded by {@link #countLock}:
+     * increments happen exactly once per decided request (the single memo
+     * winner) while holding it, and strongly-consistent reads take the same
+     * lock. Because every read/write is linearized on one lock the totals are
+     * exact — never lost, duplicated, torn or momentarily shrinking — even
+     * with concurrent decisions and concurrent rate changes. The lock is
+     * uncontended on the hot path apart from that one commit per request.
+     */
     private static final class EndpointStats {
-        private final LongAdder considered = new LongAdder();
-        private final LongAdder sampled = new LongAdder();
+        private long considered;
+        private long sampled;
     }
 
     /**
@@ -54,6 +64,16 @@ public final class Sampler {
      */
     private final AtomicReference<Config> config;
     private final ConcurrentHashMap<String, EndpointStats> statsByEndpoint = new ConcurrentHashMap<>();
+
+    /**
+     * Serializes the single per-request winning count against strongly-consistent
+     * count snapshots. It is taken once per request (only by the thread that wins
+     * the request's memo), so the hot path still performs one volatile read plus a
+     * cheap uncontended monitor. A snapshot taken under this lock has a
+     * happens-before edge with every count committed before it, so it never shows
+     * torn or momentarily-shrinking totals even while other threads are deciding.
+     */
+    private final Object countLock = new Object();
 
     public Sampler(double defaultRate, Map<String, Double> perEndpointRates) {
         validateRate(defaultRate, "defaultRate");
@@ -83,10 +103,16 @@ public final class Sampler {
         SamplingDecision winner = context.memoizeSamplingDecision(candidate);
         if (winner == candidate) {
             // This thread installed the first (and only) decision for the request.
-            EndpointStats stats = statsByEndpoint.computeIfAbsent(winner.endpoint(), k -> new EndpointStats());
-            stats.considered.increment();
-            if (winner.sampled()) {
-                stats.sampled.increment();
+            // Commit both counters under countLock so a strongly-consistent
+            // snapshot can never observe considered without the matching sampled
+            // increment (or vice-versa) and totals never appear to shrink.
+            EndpointStats stats;
+            synchronized (countLock) {
+                stats = statsByEndpoint.computeIfAbsent(winner.endpoint(), k -> new EndpointStats());
+                stats.considered++;
+                if (winner.sampled()) {
+                    stats.sampled++;
+                }
             }
         }
         return winner;
@@ -184,32 +210,61 @@ public final class Sampler {
      * Per-endpoint decision stats: how many requests were considered, how many
      * were kept, and the rate currently in effect (with its source). This is
      * the "what is actually in use right now" view.
+     *
+     * <p>Counters are read under {@link #countLock}, so the returned rows are a
+     * strongly-consistent point-in-time snapshot: {@code considered},
+     * {@code sampled} and {@code notSampled} are exact (the invariant
+     * {@code considered == sampled + notSampled} holds for every row) even while
+     * other threads are deciding or changing the rate.
      */
     public Map<String, Object> statsSnapshot() {
         Config snapshot = config.get();
         Map<String, Object> out = new TreeMap<>();
-        statsByEndpoint.forEach((endpoint, stats) -> {
-            long considered = stats.considered.sum();
-            long sampled = stats.sampled.sum();
-            Double override = snapshot.overrides().get(endpoint);
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("considered", considered);
-            row.put("sampled", sampled);
-            row.put("notSampled", considered - sampled);
-            row.put("sampleRate", override != null ? override : snapshot.defaultRate());
-            row.put("sampleRateSource", override != null ? "endpoint" : "default");
-            out.put(endpoint, row);
-        });
+        synchronized (countLock) {
+            statsByEndpoint.forEach((endpoint, stats) -> {
+                long considered = stats.considered;
+                long sampled = stats.sampled;
+                Double override = snapshot.overrides().get(endpoint);
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("considered", considered);
+                row.put("sampled", sampled);
+                row.put("notSampled", considered - sampled);
+                row.put("sampleRate", override != null ? override : snapshot.defaultRate());
+                row.put("sampleRateSource", override != null ? "endpoint" : "default");
+                out.put(endpoint, row);
+            });
+        }
         return out;
     }
 
-    /** Total events deliberately suppressed by the sampling policy. */
+    /**
+     * Total events deliberately suppressed by the sampling policy. Read under
+     * {@link #countLock}, so the value is a strongly-consistent exact total that
+     * neither misses nor double-counts a decision, even under concurrent
+     * decisions and concurrent rate changes.
+     */
     public long notSampledCount() {
-        long[] total = {0L};
-        statsByEndpoint.forEachValue(1, stats -> {
-            total[0] += stats.considered.sum() - stats.sampled.sum();
-        });
-        return total[0];
+        synchronized (countLock) {
+            long total = 0L;
+            for (EndpointStats stats : statsByEndpoint.values()) {
+                total += stats.considered - stats.sampled;
+            }
+            return total;
+        }
+    }
+
+    /**
+     * Total requests considered (decided) so far, summed under
+     * {@link #countLock} for an exact, strongly-consistent value.
+     */
+    public long consideredCount() {
+        synchronized (countLock) {
+            long total = 0L;
+            for (EndpointStats stats : statsByEndpoint.values()) {
+                total += stats.considered;
+            }
+            return total;
+        }
     }
 
     // ---- Validation --------------------------------------------------------

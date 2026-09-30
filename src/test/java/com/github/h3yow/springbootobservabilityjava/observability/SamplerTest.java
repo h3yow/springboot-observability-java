@@ -293,4 +293,99 @@ class SamplerTest {
         assertThat(((Number) bRow.get("sampled")).longValue()
                 + ((Number) bRow.get("notSampled")).longValue()).isEqualTo(consideredB);
     }
+
+    /**
+     * The same small set of requests is hammered concurrently from many threads
+     * while other threads churn BOTH the default rate and an endpoint override.
+     * Every request must: keep the exact verdict (and the rate it was first
+     * decided under) across all repeated and concurrent evaluations, be counted
+     * exactly once, and the strongly-consistent totals must reconcile exactly —
+     * no loss, no duplication, never an export/non-export flip.
+     */
+    @Test
+    void sameRequestsReevaluatedConcurrentlyDuringRateChurnStayStableAndCountedOnce()
+            throws Exception {
+        Sampler sampler = new Sampler(0.5, Map.of(EP_B, 0.25));
+        int requestCount = 500;
+        int evaluatorThreads = 12;
+        int evaluationsPerThread = 200;
+
+        RequestContext[] contexts = new RequestContext[requestCount];
+        Boolean[] expectedOutcome = new Boolean[requestCount];
+        double[] expectedRate = new double[requestCount];
+        for (int i = 0; i < requestCount; i++) {
+            String endpoint = i % 2 == 0 ? EP_A : EP_B;
+            contexts[i] = ctx("req-storm-" + i, endpoint);
+            // First (single-threaded) decision under the 0.5/0.25 policy pins it.
+            SamplingDecision first = sampler.decide(contexts[i]);
+            expectedOutcome[i] = first.sampled();
+            expectedRate[i] = first.rate();
+        }
+
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(evaluatorThreads + 2);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.List<java.util.concurrent.Future<?>> tasks = new java.util.ArrayList<>();
+
+        // Evaluators: repeatedly re-decide the SAME requests and demand stability.
+        for (int t = 0; t < evaluatorThreads; t++) {
+            tasks.add(pool.submit(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                for (int round = 0; round < evaluationsPerThread; round++) {
+                    for (int i = 0; i < requestCount; i++) {
+                        SamplingDecision d = sampler.decide(contexts[i]);
+                        if (d.sampled() != expectedOutcome[i] || d.rate() != expectedRate[i]) {
+                            throw new AssertionError("requestId=" + contexts[i].requestId()
+                                    + " flipped: was sampled=" + expectedOutcome[i]
+                                    + " rate=" + expectedRate[i]
+                                    + ", now sampled=" + d.sampled() + " rate=" + d.rate());
+                        }
+                    }
+                }
+                return null;
+            }));
+        }
+        // Churners: flip the default and the EP_B override to the 0/1 boundaries.
+        for (int c = 0; c < 2; c++) {
+            tasks.add(pool.submit(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                for (int i = 0; i < 5_000; i++) {
+                    sampler.setDefaultRate(i % 2 == 0 ? 0.0 : 1.0);
+                    sampler.setEndpointRate(EP_B, i % 3 == 0 ? 0.0 : 1.0);
+                }
+                return null;
+            }));
+        }
+
+        start.countDown();
+        for (java.util.concurrent.Future<?> f : tasks) {
+            f.get(60, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        pool.shutdownNow();
+
+        // Every request was counted exactly once despite ~1.2M re-evaluations.
+        long considered = sampler.consideredCount();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> aRow = (Map<String, Object>) sampler.statsSnapshot().get(EP_A);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> bRow = (Map<String, Object>) sampler.statsSnapshot().get(EP_B);
+        long sampled = ((Number) aRow.get("sampled")).longValue()
+                + ((Number) bRow.get("sampled")).longValue();
+        long notSampled = ((Number) aRow.get("notSampled")).longValue()
+                + ((Number) bRow.get("notSampled")).longValue();
+        log.info("verdict: {} requests re-evaluated ~{} times during boundary churn; considered={} "
+                + "sampled={} notSampled={} (sampled+notSampled={})",
+                requestCount, evaluatorThreads * evaluationsPerThread,
+                considered, sampled, notSampled, sampled + notSampled);
+        assertThat(considered).isEqualTo(requestCount);
+        assertThat(sampled + notSampled).isEqualTo(requestCount);
+    }
 }
