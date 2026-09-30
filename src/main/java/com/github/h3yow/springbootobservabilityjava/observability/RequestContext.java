@@ -76,6 +76,15 @@ public final class RequestContext {
                 : samplingDecision.get();
     }
 
+    /**
+     * Returns the decision already pinned for this request, or {@code null}
+     * if it has never been evaluated. Lets callers reuse the pinned decision
+     * without paying for (or racing on) a fresh evaluation.
+     */
+    SamplingDecision samplingDecision() {
+        return samplingDecision.get();
+    }
+
     @Override
     public String toString() {
         return "RequestContext{requestId=" + requestId + ", endpoint=" + endpoint + "}";

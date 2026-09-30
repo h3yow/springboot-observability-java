@@ -20,11 +20,14 @@ import java.io.IOException;
  *       request thread;</li>
  *   <li>echoes the request id on the response so callers can correlate;</li>
  *   <li>on completion, records endpoint metrics for <em>every</em> request and,
- *       if the per-request {@link Sampler} decision keeps it, submits one
- *       export event — always in a {@code finally} block, so the context is
- *       detached and the request thread is never leaked into the pool.
- *       Suppressed events are logged with the decision basis as
- *       {@code NOT_SAMPLED}, distinct from queue/exporter drops.</li>
+ *       if the request's sampling decision (pinned at request entry, before the
+ *       business logic runs) keeps it, submits one export event — always in a
+ *       {@code finally} block, so the context is detached and the request
+ *       thread is never leaked into the pool. A rate changed while the request
+ *       is in flight can therefore never flip it: the decision is frozen under
+ *       the policy active when processing began. Suppressed events are logged
+ *       with the decision basis as {@code NOT_SAMPLED}, distinct from
+ *       queue/exporter drops.</li>
  * </ol>
  *
  * <p>Duplicate injection is rejected: if a context is already bound to the
@@ -65,6 +68,16 @@ public class RequestContextFilter extends OncePerRequestFilter {
         RequestContextHolder.attach(context);
         response.setHeader(properties.getRequestIdHeader(), context.requestId());
 
+        // Pin the sampling verdict BEFORE business processing starts, under the
+        // policy active at request entry. Recalled in finally (and by any
+        // fan-out branch), so a runtime rate change while this request is still
+        // in flight neither flips this request nor leaks into another one.
+        SamplingDecision decision = sampler.decide(context);
+        if (log.isDebugEnabled()) {
+            log.debug("sampling decision pinned at request entry: requestId={} {}",
+                    context.requestId(), decision.basis());
+        }
+
         boolean success = false;
         try {
             filterChain.doFilter(request, response);
@@ -75,7 +88,7 @@ public class RequestContextFilter extends OncePerRequestFilter {
             // stats always cover every completed request.
             metricsRegistry.record(endpoint, success, latencyNanos);
 
-            SamplingDecision decision = sampler.decide(context);
+            // Reuse the decision pinned at entry; never re-decide here.
             if (!decision.sampled()) {
                 log.warn("metrics event not sampled: requestId={} {}", context.requestId(), decision.basis());
             } else {

@@ -23,11 +23,15 @@ import java.util.concurrent.atomic.LongAdder;
  *       request evaluated any number of times — including concurrently from
  *       fan-out branches — always gets the identical outcome. The per-request
  *       memo has at most one entry, so it can never grow unboundedly.</li>
- *   <li><b>Runtime changes take effect immediately for new requests</b>: the
- *       active configuration is one immutable snapshot behind a
- *       {@code volatile} reference. New requests read the new snapshot;
- *       requests already in flight keep their memoized decision, so a mid-flight
- *       change never re-attributes or flips an in-flight request.</li>
+ *   <li><b>Runtime changes take effect only for requests that start afterwards</b>:
+ *       the active configuration is one immutable snapshot behind a
+ *       {@code volatile} reference. The pipeline evaluates a request once, at
+ *       request entry <em>before business processing begins</em>, and pins the
+ *       result on its context; completion (and fan-out branches) only recalls
+ *       it. A rate changed while a request is in flight therefore never flips
+ *       that request or leaks into another one — only requests whose first
+ *       evaluation happens after the swap see the new rate. The request that
+ *       performs the change is itself decided on entry, under the old rate.</li>
  *   <li><b>Counts are exact under concurrency</b>: only the single winning
  *       memoization per request updates {@link LongAdder} stats, so decisions
  *       are neither lost nor double-counted.</li>
@@ -44,8 +48,10 @@ public final class Sampler {
     }
 
     private static final class EndpointStats {
-        private final LongAdder considered = new LongAdder();
-        private final LongAdder sampled = new LongAdder();
+        /** Requests the policy kept (may be exported). */
+        private final LongAdder kept = new LongAdder();
+        /** Requests the policy deliberately suppressed. */
+        private final LongAdder dropped = new LongAdder();
     }
 
     /**
@@ -79,14 +85,25 @@ public final class Sampler {
         if (context == null) {
             throw new NullPointerException("context must not be null; sampling never fabricates attribution");
         }
+        // Fast path: a decision already pinned for this request (e.g. it was
+        // made at request entry and is recalled on completion, or by a fan-out
+        // branch). Never re-evaluate: the pinned rate/outcome must stay stable
+        // even while the active config churns on other threads.
+        SamplingDecision pinned = context.samplingDecision();
+        if (pinned != null) {
+            return pinned;
+        }
         SamplingDecision candidate = evaluate(context, config.get());
         SamplingDecision winner = context.memoizeSamplingDecision(candidate);
         if (winner == candidate) {
             // This thread installed the first (and only) decision for the request.
+            // Exactly one of kept/dropped is incremented per request, so any
+            // concurrent reader always observes considered == kept + dropped.
             EndpointStats stats = statsByEndpoint.computeIfAbsent(winner.endpoint(), k -> new EndpointStats());
-            stats.considered.increment();
             if (winner.sampled()) {
-                stats.sampled.increment();
+                stats.kept.increment();
+            } else {
+                stats.dropped.increment();
             }
         }
         return winner;
@@ -189,13 +206,14 @@ public final class Sampler {
         Config snapshot = config.get();
         Map<String, Object> out = new TreeMap<>();
         statsByEndpoint.forEach((endpoint, stats) -> {
-            long considered = stats.considered.sum();
-            long sampled = stats.sampled.sum();
+            long sampled = stats.kept.sum();
+            long notSampled = stats.dropped.sum();
+            long considered = sampled + notSampled;
             Double override = snapshot.overrides().get(endpoint);
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("considered", considered);
             row.put("sampled", sampled);
-            row.put("notSampled", considered - sampled);
+            row.put("notSampled", notSampled);
             row.put("sampleRate", override != null ? override : snapshot.defaultRate());
             row.put("sampleRateSource", override != null ? "endpoint" : "default");
             out.put(endpoint, row);
@@ -205,10 +223,11 @@ public final class Sampler {
 
     /** Total events deliberately suppressed by the sampling policy. */
     public long notSampledCount() {
+        // Sequential traversal with a local accumulator: forEachValue with a
+        // parallelism threshold >1 may run updates on multiple threads, and
+        // "+=" on a shared cell is not atomic — that used to lose increments.
         long[] total = {0L};
-        statsByEndpoint.forEachValue(1, stats -> {
-            total[0] += stats.considered.sum() - stats.sampled.sum();
-        });
+        statsByEndpoint.forEachValue(Long.MAX_VALUE, stats -> total[0] += stats.dropped.sum());
         return total[0];
     }
 

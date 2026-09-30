@@ -293,4 +293,147 @@ class SamplerTest {
         assertThat(((Number) bRow.get("sampled")).longValue()
                 + ((Number) bRow.get("notSampled")).longValue()).isEqualTo(consideredB);
     }
+
+    @Test
+    void oneRequestEvaluatedConcurrentlyByManyThreadsGetsOneStableDecision() throws Exception {
+        Sampler sampler = new Sampler(0.5, Map.of());
+        RequestContext c = ctx("req-concurrent-one", EP_A);
+        int threads = 32;
+        int evaluationsPerThread = 500;
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(threads);
+        java.util.List<java.util.concurrent.Future<SamplingDecision>> futures =
+                new java.util.ArrayList<>();
+
+        // Churn the policy concurrently too: the pinned decision must survive it.
+        Thread flipper = new Thread(() -> {
+            try {
+                start.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            for (int i = 0; i < 2_000; i++) {
+                sampler.setDefaultRate(i % 2 == 0 ? 0.0 : 1.0);
+            }
+        });
+        flipper.start();
+
+        for (int t = 0; t < threads; t++) {
+            futures.add(pool.submit(() -> {
+                start.await();
+                SamplingDecision first = null;
+                for (int i = 0; i < evaluationsPerThread; i++) {
+                    SamplingDecision d = sampler.decide(c);
+                    if (first == null) {
+                        first = d;
+                    } else {
+                        assertThat(d).isSameAs(first); // identical instance, not just equal outcome
+                    }
+                }
+                return first;
+            }));
+        }
+        start.countDown();
+
+        SamplingDecision expected = null;
+        for (java.util.concurrent.Future<SamplingDecision> f : futures) {
+            SamplingDecision d = f.get(30, java.util.concurrent.TimeUnit.SECONDS);
+            if (expected == null) {
+                expected = d;
+            } else {
+                assertThat(d).isSameAs(expected);
+            }
+        }
+        flipper.join();
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> row = (Map<String, Object>) sampler.statsSnapshot().get(EP_A);
+        log.info("verdict: requestId=req-concurrent-one {} evaluations x {} threads, considered={} sampled={} (must be 1 / 0|1)",
+                evaluationsPerThread, threads, row.get("considered"), row.get("sampled"));
+        assertThat(row.get("considered")).isEqualTo(1L);
+        assertThat(row.get("sampled")).isEqualTo(expected.sampled() ? 1L : 0L);
+        assertThat(row.get("notSampled")).isEqualTo(expected.sampled() ? 0L : 1L);
+        pool.shutdownNow();
+    }
+
+    @Test
+    void concurrentStatsReadersAlwaysSeeConsistentCountsWhileRatesChurn() throws Exception {
+        Sampler sampler = new Sampler(0.5, Map.of(EP_B, 0.25));
+        int writerThreads = 8;
+        int requestsPerThread = 2_000;
+        int totalRequests = writerThreads * requestsPerThread;
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(writerThreads + 3);
+        java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+
+        for (int t = 0; t < writerThreads; t++) {
+            int thread = t;
+            futures.add(pool.submit(() -> {
+                start.await();
+                for (int i = 0; i < requestsPerThread; i++) {
+                    String endpoint = (i + thread) % 2 == 0 ? EP_A : EP_B;
+                    RequestContext c = ctx("req-stats-" + thread + "-" + i, endpoint);
+                    sampler.decide(c);
+                }
+                return null;
+            }));
+        }
+        // Readers must never observe a torn invariant (kept + dropped != considered),
+        // and notSampledCount must never lose or invent updates.
+        java.util.List<java.util.concurrent.Future<?>> readers = new java.util.ArrayList<>();
+        for (int r = 0; r < 2; r++) {
+            readers.add(pool.submit(() -> {
+                start.await();
+                long lastNotSampled = 0L;
+                for (int i = 0; i < 20_000; i++) {
+                    Map<String, Object> snapshot = sampler.statsSnapshot();
+                    for (Object value : snapshot.values()) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> row = (Map<String, Object>) value;
+                        long considered = ((Number) row.get("considered")).longValue();
+                        long sampled = ((Number) row.get("sampled")).longValue();
+                        long notSampled = ((Number) row.get("notSampled")).longValue();
+                        assertThat(sampled + notSampled)
+                                .as("considered must always equal sampled + notSampled")
+                                .isEqualTo(considered);
+                    }
+                    long total = sampler.notSampledCount();
+                    assertThat(total).as("notSampledCount is monotonic").isGreaterThanOrEqualTo(lastNotSampled);
+                    lastNotSampled = total;
+                }
+                return null;
+            }));
+        }
+        // Concurrent policy churn on both the default and one endpoint.
+        futures.add(pool.submit(() -> {
+            start.await();
+            for (int i = 0; i < 2_000; i++) {
+                sampler.setDefaultRate(i % 3 / 3.0d);
+                sampler.setEndpointRate(EP_B, ((i % 4) + 1) / 4.0d);
+            }
+            return null;
+        }));
+
+        start.countDown();
+        for (java.util.concurrent.Future<?> f : futures) {
+            f.get(60, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        for (java.util.concurrent.Future<?> f : readers) {
+            f.get(60, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        pool.shutdownNow();
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> aRow = (Map<String, Object>) sampler.statsSnapshot().get(EP_A);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> bRow = (Map<String, Object>) sampler.statsSnapshot().get(EP_B);
+        long consideredA = ((Number) aRow.get("considered")).longValue();
+        long consideredB = ((Number) bRow.get("considered")).longValue();
+        log.info("verdict: readers saw no torn counts; consideredA={} consideredB={} sum={} (expected {}) notSampledTotal={}",
+                consideredA, consideredB, consideredA + consideredB, totalRequests,
+                sampler.notSampledCount());
+        assertThat(consideredA + consideredB).isEqualTo(totalRequests);
+    }
 }
